@@ -1,4 +1,3 @@
-# .github/workflows/manual-sync-release.yml
 name: 手动同步多个 Tag 的 Release
 
 on:
@@ -54,7 +53,6 @@ jobs:
           echo "目标分支: $TARGET_BRANCH"
           echo "输入的原始 tags: $RAW_TAGS"
           
-          # 分割逗号，去除空格和空项
           IFS=',' read -ra TAGS_ARRAY <<< "$RAW_TAGS"
           
           for tag in "${TAGS_ARRAY[@]}"; do
@@ -71,7 +69,6 @@ jobs:
             API_URL="https://api.github.com/repos/$UPSTREAM_REPO/releases/tags/$CLEAN_TAG"
             echo "请求 API: $API_URL"
             
-            # 使用 -i 获取响应头，-s 静默但输出内容，同时保存 HTTP 状态码
             RESPONSE_FILE=$(mktemp)
             HTTP_CODE=$(curl -s -o "$RESPONSE_FILE" -w "%{http_code}" \
               -H "Accept: application/vnd.github.v3+json" \
@@ -82,13 +79,15 @@ jobs:
             
             if [ "$HTTP_CODE" -eq 200 ]; then
               echo "✅ 上游存在 Release: $CLEAN_TAG"
-              # 可选：打印 release 名称供确认
               RELEASE_NAME=$(jq -r '.name // .tag_name' "$RESPONSE_FILE")
               echo "Release 名称: $RELEASE_NAME"
+              
+              # 保存 assets 列表供后续下载使用（避免重复请求）
+              ASSETS_JSON=$(mktemp)
+              jq '.assets' "$RESPONSE_FILE" > "$ASSETS_JSON"
             elif [ "$HTTP_CODE" -eq 404 ]; then
               echo "❌ 错误：上游不存在 Release $CLEAN_TAG (HTTP 404)"
               echo "请检查 tag 名称是否正确，以及该仓库是否有此 release。"
-              # 打印上游部分已有的 tags 作为参考（最多5个）
               echo "尝试获取上游最近 5 个 release tags 供参考："
               curl -s -H "User-Agent: GitHub-Action-Sync" "https://api.github.com/repos/$UPSTREAM_REPO/releases?per_page=5" | jq -r '.[].tag_name' | head -5 || echo "无法获取参考列表"
               rm -f "$RESPONSE_FILE"
@@ -125,15 +124,38 @@ jobs:
               git push origin :refs/tags/"$CLEAN_TAG"
             fi
             
-            # 3. 下载上游 Release assets
+            # 3. 下载上游 Release assets（修复：使用 curl 直接获取，避免 GITHUB_TOKEN 跨仓库权限问题）
             mkdir -p "downloaded_$CLEAN_TAG"
             cd "downloaded_$CLEAN_TAG"
-            if ! gh release download "$CLEAN_TAG" --repo "$UPSTREAM_REPO" --pattern '*' --clobber; then
+            
+            DOWNLOAD_SUCCESS=true
+            # 从保存的 assets JSON 中提取下载 URL
+            DOWNLOAD_URLS=$(jq -r '.[].browser_download_url' "$ASSETS_JSON")
+            rm -f "$ASSETS_JSON"
+            
+            if [ -z "$DOWNLOAD_URLS" ]; then
+              echo "⚠️ 该 Release 没有关联的 assets 文件"
+              # 仍然可以创建空 Release，但后续会因为没有文件而跳过创建
+            else
+              echo "开始下载以下 assets："
+              echo "$DOWNLOAD_URLS"
+              for url in $DOWNLOAD_URLS; do
+                echo "下载: $url"
+                if ! curl -L -O --fail "$url"; then
+                  echo "❌ 下载失败: $url"
+                  DOWNLOAD_SUCCESS=false
+                  break
+                fi
+              done
+            fi
+            
+            if [ "$DOWNLOAD_SUCCESS" = false ]; then
               echo "❌ 下载失败，跳过此 tag"
               cd ..
               rm -rf "downloaded_$CLEAN_TAG"
               continue
             fi
+            
             echo "下载完成，文件列表："
             ls -la
             cd ..
@@ -141,7 +163,7 @@ jobs:
             # 4. 创建本仓库 Release 并上传资产
             DOWNLOAD_DIR="downloaded_$CLEAN_TAG"
             if [ ! -d "$DOWNLOAD_DIR" ] || [ -z "$(ls -A $DOWNLOAD_DIR)" ]; then
-              echo "❌ 错误：没有下载到任何文件，跳过"
+              echo "⚠️ 没有下载到任何文件，跳过创建 Release"
               rm -rf "$DOWNLOAD_DIR"
               continue
             fi
