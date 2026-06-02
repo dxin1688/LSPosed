@@ -1,0 +1,125 @@
+# .github/workflows/manual-sync-release.yml
+name: 手动同步多个 Tag 的 Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: '上游仓库 (格式: owner/repo)'
+        required: true
+        default: 'Linuxoid-cn/Mi8G3-Unlocker'
+        type: string
+      tags:
+        description: '要同步的上游 Release Tag，多个用英文逗号分隔 (例如: v6.0.0, v6.1.0)'
+        required: true
+        type: string
+      target_branch:
+        description: '目标分支 (留空则自动检测默认分支)'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 自动获取当前仓库的默认分支（如果用户未指定）
+      - name: 确定目标分支
+        id: branch
+        run: |
+          if [ -n "${{ github.event.inputs.target_branch }}" ]; then
+            TARGET_BRANCH="${{ github.event.inputs.target_branch }}"
+          else
+            # 获取远程默认分支（通常是 main/master）
+            TARGET_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD | sed 's@^refs/remotes/origin/@@')
+          fi
+          echo "target_branch=$TARGET_BRANCH" >> $GITHUB_OUTPUT
+          echo "使用目标分支: $TARGET_BRANCH"
+
+      - name: 解析并顺序处理每个 Tag
+        id: process
+        run: |
+          UPSTREAM_REPO="${{ github.event.inputs.upstream_repo }}"
+          RAW_TAGS="${{ github.event.inputs.tags }}"
+          TARGET_BRANCH="${{ steps.branch.outputs.target_branch }}"
+          
+          echo "上游仓库: $UPSTREAM_REPO"
+          echo "目标分支: $TARGET_BRANCH"
+          
+          # 分割逗号，去除空格和空项
+          IFS=',' read -ra TAGS_ARRAY <<< "$RAW_TAGS"
+          
+          for tag in "${TAGS_ARRAY[@]}"; do
+            # 去除前后空白
+            CLEAN_TAG=$(echo "$tag" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            if [ -z "$CLEAN_TAG" ]; then
+              continue
+            fi
+            
+            echo "========================================="
+            echo "开始处理 Tag: $CLEAN_TAG"
+            echo "========================================="
+            
+            # 1. 检查上游是否存在
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" https://api.github.com/repos/$UPSTREAM_REPO/releases/tags/$CLEAN_TAG)
+            if [ "$HTTP_CODE" -ne 200 ]; then
+              echo "❌ 错误：上游不存在 Release $CLEAN_TAG (HTTP $HTTP_CODE)，跳过"
+              continue
+            fi
+            echo "✅ 上游存在 Release: $CLEAN_TAG"
+            
+            # 2. 删除本仓库已存在的同名 Release 和 Tag
+            if gh release view "$CLEAN_TAG" &>/dev/null; then
+              echo "删除已存在的 release: $CLEAN_TAG"
+              gh release delete "$CLEAN_TAG" --yes
+            else
+              echo "本仓库不存在 release $CLEAN_TAG"
+            fi
+            
+            if git rev-parse "$CLEAN_TAG" >/dev/null 2>&1; then
+              echo "删除本地 tag: $CLEAN_TAG"
+              git tag -d "$CLEAN_TAG"
+            fi
+            
+            if git ls-remote --tags origin | grep -q "refs/tags/$CLEAN_TAG$"; then
+              echo "删除远程 tag: $CLEAN_TAG"
+              git push origin :refs/tags/"$CLEAN_TAG"
+            fi
+            
+            # 3. 下载上游 Release assets
+            mkdir -p "downloaded_$CLEAN_TAG"
+            cd "downloaded_$CLEAN_TAG"
+            gh release download "$CLEAN_TAG" --repo "$UPSTREAM_REPO" --pattern '*' --clobber
+            echo "下载完成，文件列表："
+            ls -la
+            cd ..
+            
+            # 4. 创建本仓库 Release 并上传资产
+            DOWNLOAD_DIR="downloaded_$CLEAN_TAG"
+            if [ ! -d "$DOWNLOAD_DIR" ] || [ -z "$(ls -A $DOWNLOAD_DIR)" ]; then
+              echo "❌ 错误：没有下载到任何文件，跳过"
+              rm -rf "$DOWNLOAD_DIR"
+              continue
+            fi
+            
+            gh release create "$CLEAN_TAG" \
+              --title "$CLEAN_TAG" \
+              --notes "手动同步自上游 [$UPSTREAM_REPO](https://github.com/$UPSTREAM_REPO/releases/tag/$CLEAN_TAG)" \
+              --target "$TARGET_BRANCH" \
+              "$DOWNLOAD_DIR"/*
+            
+            # 清理临时目录
+            rm -rf "$DOWNLOAD_DIR"
+            echo "✅ Tag $CLEAN_TAG 处理完成"
+            echo ""
+          done
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
