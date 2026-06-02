@@ -82,7 +82,7 @@ jobs:
               RELEASE_NAME=$(jq -r '.name // .tag_name' "$RESPONSE_FILE")
               echo "Release 名称: $RELEASE_NAME"
               
-              # 保存 assets 列表供后续下载使用（避免重复请求）
+              # 保存 assets 列表
               ASSETS_JSON=$(mktemp)
               jq '.assets' "$RESPONSE_FILE" > "$ASSETS_JSON"
             elif [ "$HTTP_CODE" -eq 404 ]; then
@@ -124,46 +124,67 @@ jobs:
               git push origin :refs/tags/"$CLEAN_TAG"
             fi
             
-            # 3. 下载上游 Release assets（修复：使用 curl 直接获取，避免 GITHUB_TOKEN 跨仓库权限问题）
-            mkdir -p "downloaded_$CLEAN_TAG"
-            cd "downloaded_$CLEAN_TAG"
+            # 3. 下载上游 Release assets（修复：逐个下载，跳过失败的，记录成功的）
+            DOWNLOAD_DIR="downloaded_$CLEAN_TAG"
+            mkdir -p "$DOWNLOAD_DIR"
             
-            DOWNLOAD_SUCCESS=true
-            # 从保存的 assets JSON 中提取下载 URL
-            DOWNLOAD_URLS=$(jq -r '.[].browser_download_url' "$ASSETS_JSON")
+            # 从 assets JSON 提取下载 URL 和文件名
+            ASSET_COUNT=$(jq '. | length' "$ASSETS_JSON")
+            echo "共有 $ASSET_COUNT 个 asset"
+            
+            SUCCESS_COUNT=0
+            FAILED_URLS=""
+            
+            for ((i=0; i<ASSET_COUNT; i++)); do
+              URL=$(jq -r ".[$i].browser_download_url" "$ASSETS_JSON")
+              NAME=$(jq -r ".[$i].name" "$ASSETS_JSON")
+              
+              if [ -z "$URL" ] || [ "$URL" = "null" ]; then
+                echo "⚠️ asset #$i 没有有效的下载 URL，跳过"
+                continue
+              fi
+              
+              echo "下载: $NAME"
+              echo "URL: $URL"
+              
+              # 使用 curl 下载，允许重定向，设置重试，输出到指定文件
+              cd "$DOWNLOAD_DIR"
+              if curl -L --fail --retry 3 --retry-delay 2 -O "$URL" 2>&1; then
+                echo "✅ 下载成功: $NAME"
+                SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+              else
+                echo "❌ 下载失败: $NAME"
+                FAILED_URLS="${FAILED_URLS}\n  - $URL"
+              fi
+              cd ..
+            done
+            
             rm -f "$ASSETS_JSON"
             
-            if [ -z "$DOWNLOAD_URLS" ]; then
-              echo "⚠️ 该 Release 没有关联的 assets 文件"
-              # 仍然可以创建空 Release，但后续会因为没有文件而跳过创建
-            else
-              echo "开始下载以下 assets："
-              echo "$DOWNLOAD_URLS"
-              for url in $DOWNLOAD_URLS; do
-                echo "下载: $url"
-                if ! curl -L -O --fail "$url"; then
-                  echo "❌ 下载失败: $url"
-                  DOWNLOAD_SUCCESS=false
-                  break
-                fi
-              done
-            fi
-            
-            if [ "$DOWNLOAD_SUCCESS" = false ]; then
-              echo "❌ 下载失败，跳过此 tag"
-              cd ..
-              rm -rf "downloaded_$CLEAN_TAG"
+            if [ $SUCCESS_COUNT -eq 0 ]; then
+              echo "❌ 没有成功下载任何资产，跳过此 tag"
+              rm -rf "$DOWNLOAD_DIR"
               continue
             fi
             
-            echo "下载完成，文件列表："
-            ls -la
-            cd ..
+            if [ -n "$FAILED_URLS" ]; then
+              echo "⚠️ 警告：以下 $((ASSET_COUNT - SUCCESS_COUNT)) 个资产下载失败："
+              echo -e "$FAILED_URLS"
+              echo "将只上传成功下载的 $SUCCESS_COUNT 个文件"
+            fi
             
-            # 4. 创建本仓库 Release 并上传资产
-            DOWNLOAD_DIR="downloaded_$CLEAN_TAG"
-            if [ ! -d "$DOWNLOAD_DIR" ] || [ -z "$(ls -A $DOWNLOAD_DIR)" ]; then
-              echo "⚠️ 没有下载到任何文件，跳过创建 Release"
+            echo "下载完成，成功文件列表："
+            ls -la "$DOWNLOAD_DIR"
+            
+            # 4. 创建本仓库 Release 并上传资产（只上传存在的文件）
+            # 注意：gh release create 接受多个文件路径，但路径中不能有通配符？这里直接传递所有文件
+            FILES=()
+            while IFS= read -r -d '' file; do
+              FILES+=("$file")
+            done < <(find "$DOWNLOAD_DIR" -type f -print0)
+            
+            if [ ${#FILES[@]} -eq 0 ]; then
+              echo "❌ 错误：没有有效的文件可上传"
               rm -rf "$DOWNLOAD_DIR"
               continue
             fi
@@ -172,7 +193,7 @@ jobs:
               --title "$CLEAN_TAG" \
               --notes "手动同步自上游 [$UPSTREAM_REPO](https://github.com/$UPSTREAM_REPO/releases/tag/$CLEAN_TAG)" \
               --target "$TARGET_BRANCH" \
-              "$DOWNLOAD_DIR"/*
+              "${FILES[@]}"
             
             # 清理临时目录
             rm -rf "$DOWNLOAD_DIR"
