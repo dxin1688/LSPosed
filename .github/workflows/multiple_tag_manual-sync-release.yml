@@ -31,14 +31,12 @@ jobs:
         with:
           fetch-depth: 0
 
-      # 自动获取当前仓库的默认分支（如果用户未指定）
       - name: 确定目标分支
         id: branch
         run: |
           if [ -n "${{ github.event.inputs.target_branch }}" ]; then
             TARGET_BRANCH="${{ github.event.inputs.target_branch }}"
           else
-            # 获取远程默认分支（通常是 main/master）
             TARGET_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD | sed 's@^refs/remotes/origin/@@')
           fi
           echo "target_branch=$TARGET_BRANCH" >> $GITHUB_OUTPUT
@@ -51,14 +49,15 @@ jobs:
           RAW_TAGS="${{ github.event.inputs.tags }}"
           TARGET_BRANCH="${{ steps.branch.outputs.target_branch }}"
           
+          echo "========== 配置信息 =========="
           echo "上游仓库: $UPSTREAM_REPO"
           echo "目标分支: $TARGET_BRANCH"
+          echo "输入的原始 tags: $RAW_TAGS"
           
           # 分割逗号，去除空格和空项
           IFS=',' read -ra TAGS_ARRAY <<< "$RAW_TAGS"
           
           for tag in "${TAGS_ARRAY[@]}"; do
-            # 去除前后空白
             CLEAN_TAG=$(echo "$tag" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
             if [ -z "$CLEAN_TAG" ]; then
               continue
@@ -68,13 +67,45 @@ jobs:
             echo "开始处理 Tag: $CLEAN_TAG"
             echo "========================================="
             
-            # 1. 检查上游是否存在
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" https://api.github.com/repos/$UPSTREAM_REPO/releases/tags/$CLEAN_TAG)
-            if [ "$HTTP_CODE" -ne 200 ]; then
-              echo "❌ 错误：上游不存在 Release $CLEAN_TAG (HTTP $HTTP_CODE)，跳过"
+            # 1. 检查上游是否存在（带详细日志）
+            API_URL="https://api.github.com/repos/$UPSTREAM_REPO/releases/tags/$CLEAN_TAG"
+            echo "请求 API: $API_URL"
+            
+            # 使用 -i 获取响应头，-s 静默但输出内容，同时保存 HTTP 状态码
+            RESPONSE_FILE=$(mktemp)
+            HTTP_CODE=$(curl -s -o "$RESPONSE_FILE" -w "%{http_code}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              -H "User-Agent: GitHub-Action-Sync" \
+              "$API_URL")
+            
+            echo "HTTP 状态码: $HTTP_CODE"
+            
+            if [ "$HTTP_CODE" -eq 200 ]; then
+              echo "✅ 上游存在 Release: $CLEAN_TAG"
+              # 可选：打印 release 名称供确认
+              RELEASE_NAME=$(jq -r '.name // .tag_name' "$RESPONSE_FILE")
+              echo "Release 名称: $RELEASE_NAME"
+            elif [ "$HTTP_CODE" -eq 404 ]; then
+              echo "❌ 错误：上游不存在 Release $CLEAN_TAG (HTTP 404)"
+              echo "请检查 tag 名称是否正确，以及该仓库是否有此 release。"
+              # 打印上游部分已有的 tags 作为参考（最多5个）
+              echo "尝试获取上游最近 5 个 release tags 供参考："
+              curl -s -H "User-Agent: GitHub-Action-Sync" "https://api.github.com/repos/$UPSTREAM_REPO/releases?per_page=5" | jq -r '.[].tag_name' | head -5 || echo "无法获取参考列表"
+              rm -f "$RESPONSE_FILE"
+              continue
+            else
+              echo "❌ 错误：API 请求失败 (HTTP $HTTP_CODE)"
+              echo "响应体内容（前500字符）："
+              head -c 500 "$RESPONSE_FILE"
+              echo ""
+              echo "可能原因："
+              echo "  - API 限流（需提供 token）"
+              echo "  - 仓库不存在或私有"
+              echo "  - tag 名称包含特殊字符未编码"
+              rm -f "$RESPONSE_FILE"
               continue
             fi
-            echo "✅ 上游存在 Release: $CLEAN_TAG"
+            rm -f "$RESPONSE_FILE"
             
             # 2. 删除本仓库已存在的同名 Release 和 Tag
             if gh release view "$CLEAN_TAG" &>/dev/null; then
@@ -97,7 +128,12 @@ jobs:
             # 3. 下载上游 Release assets
             mkdir -p "downloaded_$CLEAN_TAG"
             cd "downloaded_$CLEAN_TAG"
-            gh release download "$CLEAN_TAG" --repo "$UPSTREAM_REPO" --pattern '*' --clobber
+            if ! gh release download "$CLEAN_TAG" --repo "$UPSTREAM_REPO" --pattern '*' --clobber; then
+              echo "❌ 下载失败，跳过此 tag"
+              cd ..
+              rm -rf "downloaded_$CLEAN_TAG"
+              continue
+            fi
             echo "下载完成，文件列表："
             ls -la
             cd ..
